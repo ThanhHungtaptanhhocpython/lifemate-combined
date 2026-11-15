@@ -35,7 +35,7 @@ def load(path: Path):
     return mod
 
 
-def train_contexts(n_needed: int, exclude: set[str], seed: int) -> list[dict]:
+def train_contexts(n_needed: int, exclude: set[str], seed: int, kit: Path = KIT) -> list[dict]:
     """(context, states) of random TRAIN samples outside validation, via a child process (one zaic_tools copy per process)."""
     code = r'''
 import json, sys, random
@@ -53,21 +53,23 @@ for x in rng.sample(items, min(int(sys.argv[5]), len(items))):
     out.append({"from": x["id"], "context": {**x["context"], "installed_apps": apps}, "states": {a: st[a] for a in apps if a in st}})
 print(json.dumps(out, ensure_ascii=False))
 '''
-    res = subprocess.run([sys.executable, "-c", code, str(KIT), str(PROJECT / "configs/splits/validation_ids.json"), ",".join(sorted(exclude)),
+    res = subprocess.run([sys.executable, "-c", code, str(kit), str(PROJECT / "configs/splits/validation_ids.json"), ",".join(sorted(exclude)),
                           str(seed), str(n_needed)], capture_output=True, text=True, check=True)
     return json.loads(res.stdout)
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--data-root", type=Path, default=KIT)
     ap.add_argument("--out", type=Path, default=PROJECT / "outputs/synth")
+    ap.add_argument("--tasks-glob", default="*.py", help="task file glob under synth/tasks (default: *.py)")
     ap.add_argument("--exclude-apps", default="", help="TRAIN apps never installed as distractors (held-out-app study)")
     ap.add_argument("--seed", type=int, default=7)
     a = ap.parse_args()
     exclude = {x for x in a.exclude_apps.split(",") if x}
     cat_mod = load(PROJECT / "synth/catalog.py")
     tasks = []
-    for f in sorted((PROJECT / "synth/tasks").glob("*.py")):
+    for f in sorted((PROJECT / "synth/tasks").glob(a.tasks_glob)):
         if f.name.startswith("_"):
             continue
         mod = load(f)
@@ -77,13 +79,13 @@ def main() -> None:
     if split.exists():
         shutil.rmtree(split)
     (split / "synth_environment").mkdir(parents=True)
-    shutil.copytree(KIT / "train/zaic_tools", split / "zaic_tools", ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copytree(a.data_root / "train/zaic_tools", split / "zaic_tools", ignore=shutil.ignore_patterns("__pycache__"))
     shutil.copy(PROJECT / "synth/apps/synth_apps.py", split / "zaic_tools/apps/synth_apps.py")
-    catalog = json.loads((KIT / "train/train_tools_catalog.json").read_text(encoding="utf-8"))
+    catalog = json.loads((a.data_root / "train/train_tools_catalog.json").read_text(encoding="utf-8"))
     catalog["apps"] = catalog["apps"] + cat_mod.APPS
     (split / "synth_tools_catalog.json").write_text(json.dumps(catalog, ensure_ascii=False, indent=1), encoding="utf-8")
     tools_of = {x["id"]: [t["name"] for t in x["tools"]] for x in catalog["apps"]}
-    bases = train_contexts(len(tasks), exclude, a.seed)
+    bases = train_contexts(len(tasks), exclude, a.seed, kit=a.data_root)
     rng = random.Random(a.seed)
     items = []
     for k, (t, base) in enumerate(zip(tasks, bases)):

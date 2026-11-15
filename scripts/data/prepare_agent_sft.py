@@ -99,6 +99,52 @@ def pseudo_asr(text: str) -> str:
     return " ".join(re.sub(r"[,.!?;:\"()]", " ", text).split())
 
 
+_ASR_SUBS = [
+    ("dời", "rời"), ("giờ", "dờ"), ("sếp", "xếp"), ("xem", "sem"), ("hài", "hai"),
+    ("trà", "chà"), ("trứng", "chứng"), ("sữa", "xữa"), ("giỏ", "rỏ"), ("gửi", "gỉ"),
+    ("sáng", "xáng"), ("chiều", "chìu"), ("chuyển", "chiển"), ("đặt", "tặt"),
+]
+
+
+def noisy_asr(text: str, seed_key: str) -> str:
+    """Deterministic noisy ASR perturbation (homophones/consonant confusions) on top of pseudo_asr."""
+    base = pseudo_asr(text)
+    words_list = base.split()
+    if len(words_list) < 3:
+        return base
+    rng = random.Random(f"noisy:{seed_key}")
+    out = []
+    changed = 0
+    sub_map = dict(_ASR_SUBS)
+    for w in words_list:
+        if changed < 2 and w in sub_map and rng.random() < 0.6:
+            out.append(sub_map[w])
+            changed += 1
+        elif changed < 2 and len(w) >= 3 and rng.random() < 0.08:
+            # realistic mild confusion: tr<->ch, s<->x, or gi->d
+            w2 = w
+            if w.startswith("tr"):
+                w2 = "ch" + w[2:]
+            elif w.startswith("s"):
+                w2 = "x" + w[1:]
+            elif w.startswith("gi"):
+                w2 = "d" + w[2:]
+            if w2 != w:
+                changed += 1
+            out.append(w2)
+        else:
+            out.append(w)
+    if changed == 0 and len(words_list) >= 4:
+        # Mild word-initial swap on one content word so noisy copy differs slightly from pseudo
+        idx = rng.randrange(1, len(words_list) - 1)
+        w = words_list[idx]
+        for a, b in (("tr", "ch"), ("ch", "tr"), ("s", "x"), ("d", "gi")):
+            if w.startswith(a) and len(w) > len(a):
+                out[idx] = b + w[len(a):]
+                break
+    return " ".join(out)
+
+
 def rename_apps(row: dict, apps: set[str], rng: random.Random) -> tuple[dict, dict]:
     """Rename every app namespace of one trajectory consistently: function aliases (app__tool), official names and x-ref values
     (app.tool, app.collection) in tools, prompts, history and observations. sys stays."""
@@ -157,7 +203,8 @@ def main() -> None:
     held = {x for x in a.exclude_apps.split(",") if x}
     specs = catalog(root, a.split)
     asr = {}
-    for line in (a.asr_cache.open(encoding="utf-8") if a.split == "train" else []):
+    need_asr = "asr" in a.variants.split(",")
+    for line in (a.asr_cache.open(encoding="utf-8") if need_asr else []):
         r = json.loads(line)
         asr[(r["sample_id"], r["audio"])] = normalize_asr(r["raw_transcript"])
     a.output_dir.mkdir(parents=True, exist_ok=False)
@@ -182,6 +229,8 @@ def main() -> None:
                     text = gold_text
                 elif variant == "pseudo":       # no audio: ASR-like rendering of the gold text (lower case, no punctuation, numbers spelled)
                     text = {x: pseudo_asr(t) for x, t in gold_text.items()}
+                elif variant == "noisy":        # deterministic noisy ASR simulation when raw Gipformer cache is unavailable locally
+                    text = {x: noisy_asr(t, f"{item['id']}:{x}") for x, t in gold_text.items()}
                 else:
                     text = {x: asr[(item["id"], x)] for x in audios}
                 row = trajectory(item, root, specs, text, a.orchestration, frozenset(held) if a.strip_held else frozenset(), split=a.split)

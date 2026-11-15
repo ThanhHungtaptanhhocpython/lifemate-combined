@@ -103,6 +103,91 @@ def _record(item: dict, index: int, call: object, log: Callable[[str, dict], Non
     log("tool_events", {"sample_id": item["id"], "turn": index, "proposed": call, **fields})
 
 
+_EMPTY_VALUES = (None, "", [], {})
+_DATE_FIELDS = {"date", "day", "start_date", "departure_date", "check_in", "time", "from_date"}
+_DATE_QUERY_RE = re.compile(
+    r"^(?:"
+    r"\d{4}-\d{2}-\d{2}"
+    r"|hôm nay|ngày mai|mai|ngày kia"
+    r"|tuần (?:này|sau|tới)"
+    r"|(?:thứ (?:hai|ba|tư|năm|sáu|bảy|[2-7])|chủ nhật)(?:\s+(?:tuần\s+(?:này|sau|tới)|này|sau|tới))?"
+    r")$"
+)
+
+
+def clean_arguments(spec: dict | None, args: dict) -> dict:
+    """Strip unknown schema keys and empty optional values; coerce whole floats for integer fields."""
+    params = (spec or {}).get("parameters") or {}
+    props = params.get("properties") or {}
+    required = set(params.get("required") or [])
+    has_props = bool(props)
+    cleaned: dict = {}
+    for key, value in args.items():
+        if has_props and key not in props:
+            continue
+        prop = props.get(key) if isinstance(props.get(key), dict) else {}
+        if prop.get("type") == "integer" and isinstance(value, float) and value.is_integer():
+            value = int(value)
+        if key not in required and value in _EMPTY_VALUES:
+            continue
+        cleaned[key] = value
+    return cleaned
+
+
+def shrink_result(result: object, limit: int = 16000, max_items: int = 40) -> str:
+    """Encode tool output as valid JSON within `limit`, truncating large lists cleanly."""
+    encoded = json.dumps(result, ensure_ascii=False)
+    if len(encoded) <= limit:
+        return encoded
+    caps = []
+    cap = max_items
+    while cap >= 5:
+        caps.append(cap)
+        cap //= 2
+    if isinstance(result, dict):
+        for cap in caps:
+            shrunk: dict = {}
+            for key, value in result.items():
+                if isinstance(value, list) and len(value) > cap:
+                    shrunk[key] = value[:cap]
+                    shrunk[f"{key}_truncated"] = len(value)
+                else:
+                    shrunk[key] = value
+            encoded = json.dumps(shrunk, ensure_ascii=False)
+            if len(encoded) <= limit:
+                return encoded
+    elif isinstance(result, list):
+        for cap in caps:
+            if len(result) > cap:
+                encoded = json.dumps({"truncated": True, "items": result[:cap], "total": len(result)}, ensure_ascii=False)
+                if len(encoded) <= limit:
+                    return encoded
+    preview = encoded[: max(0, limit - 64)]
+    while True:
+        out = json.dumps({"truncated": True, "preview": preview}, ensure_ascii=False)
+        if len(out) <= limit or not preview:
+            return out
+        step = max(1, len(out) - limit + 16)
+        preview = preview[:-step] if step < len(preview) else ""
+
+
+def _date_in_query_error(spec: dict, args: dict) -> str | None:
+    """Reject pure date/weekday strings passed to `query` when the tool exposes dedicated date parameters."""
+    if spec.get("kind") != "read" or not isinstance(args.get("query"), str):
+        return None
+    props = (spec.get("parameters") or {}).get("properties") or {}
+    date_fields = sorted(set(props) & _DATE_FIELDS)
+    if not date_fields:
+        return None
+    normalized = " ".join(args["query"].strip().lower().split())
+    if _DATE_QUERY_RE.fullmatch(normalized):
+        return (
+            f"Không đưa ngày/thứ ({args['query']!r}) vào tham số 'query'; "
+            f"hãy truyền vào tham số ngày ({', '.join(date_fields)}) theo date_reference."
+        )
+    return None
+
+
 def execute(item: dict, transcript: str, specs: list[dict], env, llm, transcribe_history: Callable[[str], str],
             log: Callable[[str, dict], None], max_turns: int = 10, deadline_seconds: float = 30, orchestration: str = "E1P",
             dedup_calls: bool = False, retry_cap: int = 0) -> dict:
@@ -121,10 +206,11 @@ def execute(item: dict, transcript: str, specs: list[dict], env, llm, transcribe
     aliases = {s["name"].replace(".", "__"): s["name"] for s in specs}
     specs_by_name = {s["name"]: s for s in specs}
     invalid_proposals = 0
-    completed_write = missing_info = failed_write = False
+    completed_write = missing_info = failed_write = cart_nudged = False
     executed_results: dict[str, object] = {}   # dedup_calls: exact (name, arguments) already executed -> its result
     duplicate_blocks = 0
     empty_reads: dict[str, int] = {}           # retry_cap: read tool -> how many of its calls came back empty / not found
+    successful_tools: set[str] = set()
 
     def finish(status: str, turns: int) -> dict:
         log("terminations", {"sample_id": item["id"], "status": status, "turns": turns, "elapsed_seconds": time.monotonic() - start,
@@ -173,6 +259,23 @@ def execute(item: dict, transcript: str, specs: list[dict], env, llm, transcribe
         messages.append({"role": "assistant", "content": message.get("content"), "tool_calls": calls} if calls
                         else {"role": "assistant", "content": content})
         if not calls:
+            pending_checkouts = [
+                f"{app}.checkout"
+                for app in sorted({t.split(".", 1)[0] for t in successful_tools if t.endswith(".add_to_cart")})
+                if f"{app}.checkout" in specs_by_name and f"{app}.checkout" not in successful_tools
+            ]
+            if pending_checkouts and not cart_nudged and not missing_info and not failed_write and index + 1 < max_turns:
+                cart_nudged = True
+                log("protocol_events", {"sample_id": item["id"], "turn": index, "kind": "cart_checkout_nudge", "tools": pending_checkouts})
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"Bạn đã thêm sản phẩm vào giỏ hàng nhưng chưa gọi {', '.join(pending_checkouts)}. "
+                        "Nếu yêu cầu của người dùng là đặt hoặc mua hàng, hãy gọi tool checkout tương ứng để hoàn tất đơn; "
+                        "nếu người dùng chỉ yêu cầu thêm vào giỏ hoặc đã xong việc thì dừng lại."
+                    ),
+                })
+                continue
             status = ("tool_error" if failed_write else "missing_information" if missing_info else "unsupported" if "UNSUPPORTED_REQUEST" in content
                       else "completed_write" if completed_write else "completed_read" if env.get_tool_calls() else "no_action")
             return finish(status, index + 1)
@@ -199,9 +302,7 @@ def execute(item: dict, transcript: str, specs: list[dict], env, llm, transcribe
             if name == "sys.ask_missing_info" and isinstance(args.get("tool_name"), str):
                 args["tool_name"] = aliases.get(args["tool_name"], args["tool_name"])
             spec = specs_by_name.get(name, {})
-            if spec.get("kind") == "read":   # drop empty optional filters
-                required = set((spec.get("parameters") or {}).get("required") or [])
-                args = {key: value for key, value in args.items() if key in required or value not in (None, "", [], {})}
+            args = clean_arguments(spec, args)
             if name in {"weather.get_current", "weather.get_forecast"} and isinstance(args.get("location"), str):
                 city = item["context"].get("user_profile", {}).get("city")   # the profile city the user did not say is the default
                 if isinstance(city, str) and args["location"].casefold().strip() == city.casefold().strip() and city.casefold() not in transcript.casefold():
@@ -213,6 +314,10 @@ def execute(item: dict, transcript: str, specs: list[dict], env, llm, transcribe
                     if reference and key in args and (not isinstance(args[key], str) or args[key] not in observed_ids.get(reference.split(".", 1)[0], set())):
                         validation = {"ok": False, "error": f"{key} must come from an observed {reference} ID; call a read tool first"}
                         break
+            if validation["ok"]:
+                date_error = _date_in_query_error(spec, args)
+                if date_error:
+                    validation = {"ok": False, "error": date_error}
             if not validation["ok"]:
                 reject(index, call, validation)
                 continue
@@ -222,7 +327,8 @@ def execute(item: dict, transcript: str, specs: list[dict], env, llm, transcribe
                 # executed call counts in the scored list; return the earlier result instead and stop a loop after three repeats.
                 duplicate_blocks += 1
                 _record(item, index, call, log, validation={"ok": False, "error": "duplicate call blocked"}, executed=False)
-                messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": json.dumps({"ok": False, "error": "Lệnh này đã được gọi với đúng các tham số này; kết quả đã có ở trên. Không gọi lại; làm bước tiếp theo hoặc kết thúc.", "previous_result": executed_results[signature]}, ensure_ascii=False)[:16000]})
+                prev = json.loads(shrink_result(executed_results[signature], limit=14000))
+                messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": shrink_result({"ok": False, "error": "Lệnh này đã được gọi với đúng các tham số này; kết quả đã có ở trên. Không gọi lại; làm bước tiếp theo hoặc kết thúc.", "previous_result": prev})})
                 if duplicate_blocks >= 3:
                     return finish("duplicate_loop", index + 1)
                 continue
@@ -242,6 +348,7 @@ def execute(item: dict, transcript: str, specs: list[dict], env, llm, transcribe
                 empty_reads[name] = empty_reads.get(name, 0) + 1
             result_outcome = outcome(result, spec.get("kind", "unknown"))
             if successful(result):
+                successful_tools.add(name)
                 observed_ids.setdefault(name.split(".", 1)[0], set()).update(ids_in(result))
             if name == "sys.ask_missing_info" and successful(result):
                 missing_info = True
@@ -250,6 +357,8 @@ def execute(item: dict, transcript: str, specs: list[dict], env, llm, transcribe
                 failed_write |= result_outcome != "completed"
             _record(item, index, call, log, validation=validation, executed=True, name=name, arguments=args, result=result,
                     outcome=result_outcome, latency_seconds=time.monotonic() - t0)
-            messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": json.dumps(result, ensure_ascii=False)[:16000]})
+            messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": shrink_result(result)})
+            if name == "sys.ask_missing_info" and successful(result):
+                return finish("missing_information", index + 1)
     log("terminations", {"sample_id": item["id"], "status": "step_limit", "turns": max_turns})
     raise RuntimeError(f"agent exceeded {max_turns} LLM turns")

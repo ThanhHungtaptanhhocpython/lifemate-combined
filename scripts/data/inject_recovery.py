@@ -77,19 +77,20 @@ def call_name(m: dict) -> str:
     return m["tool_calls"][0]["function"]["name"]
 
 
-def replay(sample_id: str, calls: list[tuple[str, dict]]) -> list:
-    env = new_env(PROJECT / "data/train+public_test", "train", sample_id)
+def replay(sample_id: str, calls: list[tuple[str, dict]], data_root: Path) -> list:
+    env = new_env(data_root, "train", sample_id)
     return [env.call(n.replace("__", ".", 1), a) for n, a in calls]
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--data-root", type=Path, default=PROJECT / "data/train+public_test")
     ap.add_argument("--input", type=Path, required=True)
     ap.add_argument("--output", type=Path, required=True)
     ap.add_argument("--seed", type=int, default=13)
     a = ap.parse_args()
     rng = random.Random(a.seed)
-    gold_text = {it["id"]: it["audio_text"] for it in items(PROJECT / "data/train+public_test", "train")}
+    gold_text = {it["id"]: it["audio_text"] for it in items(a.data_root, "train")}
     stats, out = Counter(), []
     for line in a.input.open(encoding="utf-8"):
         row = json.loads(line)
@@ -131,20 +132,20 @@ def main() -> None:
             stats["no_variant"] += 1
             continue
         before = [(call_name(m), m["tool_calls"][0]["function"]["arguments"]) for m in msgs[:idx] if m["role"] == "assistant" and m.get("tool_calls")]
-        res = replay(row["sample_id"], before + [(fn, {"query": wrong})])
+        res = replay(row["sample_id"], before + [(fn, {"query": wrong})], a.data_root)
         if hits(res[-1]):
             stats[f"{kind}_not_empty"] += 1
             continue
         if kind == "asr_name":
             last = wrong.split()[-1]
-            r_last = replay(row["sample_id"], before + [(fn, {"query": last})])[-1]
+            r_last = replay(row["sample_id"], before + [(fn, {"query": last})], a.data_root)[-1]
             recover = {"query": last} if target & set(hits(r_last)) else {}
         else:
             recover = {"query": q}
         # new call sequence: before, wrong (no loss), recovery, then the original calls after the gold search
         after_msgs = msgs[idx + 2:]
         after = [(call_name(m), m["tool_calls"][0]["function"]["arguments"]) for m in after_msgs if m["role"] == "assistant" and m.get("tool_calls")]
-        res = replay(row["sample_id"], before + [(fn, {"query": wrong}), (fn, recover)] + after)
+        res = replay(row["sample_id"], before + [(fn, {"query": wrong}), (fn, recover)] + after, a.data_root)
         if not target & set(hits(res[len(before) + 1])):
             stats[f"{kind}_recovery_misses"] += 1
             continue

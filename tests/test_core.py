@@ -3,7 +3,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from lifemate.agent import execute, prompt_for, user_message
+from lifemate.agent import clean_arguments, execute, prompt_for, shrink_result, user_message
+from lifemate.ensemble import EnsembleChat
 from lifemate.history import outcome, structured_history
 from lifemate.data import audio_path, catalog, installed_tools, items
 from lifemate.toolenv import new_env
@@ -215,6 +216,111 @@ class CoreTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             LocalChat("https://api.example.com/v1/chat/completions", "model")
         LocalChat("http://127.0.0.1:8000/v1/chat/completions", "local-model")
+
+    def test_clean_arguments_and_shrink_result(self):
+        spec = {
+            "name": "ewallet.transfer",
+            "kind": "write",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "amount": {"type": "integer"},
+                    "note": {"type": "string"},
+                    "count": {"type": "integer"},
+                },
+                "required": ["amount"],
+            },
+        }
+        cleaned = clean_arguments(spec, {"amount": 50000.0, "note": "", "count": 0, "bogus": "x"})
+        self.assertEqual(cleaned, {"amount": 50000, "count": 0})
+        self.assertIs(type(cleaned["amount"]), int)
+
+        big_list = [{"id": f"item_{i}", "label": "x" * 300} for i in range(60)]
+        encoded = shrink_result({"items": big_list, "ok": True}, limit=16000, max_items=40)
+        parsed = json.loads(encoded)
+        self.assertEqual(len(parsed["items"]), 40)
+        self.assertEqual(parsed["items_truncated"], 60)
+
+        huge_str = {"ok": True, "blob": "a" * 20000}
+        encoded_str = shrink_result(huge_str, limit=500, max_items=40)
+        self.assertLessEqual(len(encoded_str), 500)
+        self.assertTrue(json.loads(encoded_str)["truncated"])
+
+    def test_date_in_query_guardrail(self):
+        search = {
+            "name": "event_tickets.search",
+            "kind": "read",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}, "date": {"type": "string"}},
+            },
+        }
+        item = {"id": "x", "history": [], "context": {"current_time": "2026-11-09T10:00:00+07:00", "installed_apps": {"event_tickets": {}}}}
+        env = MemoryEnv()
+        model = ResponsesLLM([
+            response(call=("event_tickets__search", {"query": "thứ ba tuần sau"})),
+            response(call=("event_tickets__search", {"date": "2026-11-17"})),
+            response(),
+        ])
+        execute(item, "tìm sự kiện thứ ba tuần sau", [search], env, model, lambda _: "", lambda *_: None)
+        self.assertEqual(env.calls, [{"name": "event_tickets.search", "arguments": {"date": "2026-11-17"}}])
+        self.assertIn("Không đưa ngày/thứ", model.messages[1][-1]["content"])
+
+    def test_cart_checkout_nudge_fires_once(self):
+        add_tool = {"name": "ecommerce.add_to_cart", "kind": "write", "parameters": {"type": "object", "properties": {"product_id": {"type": "string"}}, "required": ["product_id"]}}
+        checkout_tool = {"name": "ecommerce.checkout", "kind": "write", "parameters": {"type": "object", "properties": {}}}
+        item = {"id": "x", "history": [], "context": {"current_time": "2026-11-09T10:00:00+07:00", "installed_apps": {"ecommerce": {}}}}
+        env = MemoryEnv()
+        events = []
+        model = ResponsesLLM([
+            response(call=("ecommerce__add_to_cart", {"product_id": "p1"})),
+            response(),
+            response(call=("ecommerce__checkout", {})),
+            response(),
+        ])
+        execute(item, "đặt cho tôi sản phẩm p1", [add_tool, checkout_tool], env, model, lambda _: "", lambda kind, x: events.append((kind, x)))
+        self.assertEqual([c["name"] for c in env.calls], ["ecommerce.add_to_cart", "ecommerce.checkout"])
+        self.assertTrue(any(kind == "protocol_events" and x["kind"] == "cart_checkout_nudge" for kind, x in events))
+
+    def test_ask_missing_info_stops_immediately(self):
+        ask = {"name": "sys.ask_missing_info", "kind": "meta", "parameters": {"type": "object", "properties": {"tool_name": {"type": "string"}, "params": {"type": "array", "items": {"type": "string"}}}, "required": ["tool_name", "params"]}}
+        alarm = self.ALARM_LIST
+        item = {"id": "x", "history": [], "context": {"current_time": "2026-11-09T10:00:00+07:00", "installed_apps": {"alarm": {}}}}
+        env = MemoryEnv()
+        events = []
+        model = ResponsesLLM([
+            response(call=("sys__ask_missing_info", {"tool_name": "alarm__delete", "params": ["alarm_id"]})),
+            response(call=("alarm__list", {})),
+        ])
+        execute(item, "xóa báo thức", [ask, alarm, self.ALARM_DELETE], env, model, lambda _: "", lambda kind, x: events.append((kind, x)))
+        self.assertEqual(env.calls, [{"name": "sys.ask_missing_info", "arguments": {"tool_name": "alarm.delete", "params": ["alarm_id"]}}])
+        self.assertEqual(len(model.messages), 1)
+        self.assertEqual([x["status"] for kind, x in events if kind == "terminations"], ["missing_information"])
+
+    def test_ensemble_canonicalizes_arguments_before_voting(self):
+        spec = {
+            "name": "ewallet.transfer",
+            "kind": "write",
+            "parameters": {
+                "type": "object",
+                "properties": {"amount": {"type": "integer"}, "note": {"type": "string"}},
+                "required": ["amount"],
+            },
+        }
+        item = {"id": "x", "history": [], "context": {"current_time": "2026-11-09T10:00:00+07:00", "installed_apps": {"ewallet": {}}}}
+        ens = EnsembleChat("http://127.0.0.1:8000/v1/chat/completions", [("m1", "E1P"), ("m2", "E1"), ("m3", "E1")])
+        ens.bind(item, "chuyển 50k", [spec])
+        replies = {
+            "m1": response(call=("ewallet__transfer", {"amount": 20000})),
+            "m2": response(call=("ewallet__transfer", {"amount": 50000.0, "note": "", "extra": 1})),
+            "m3": response(call=("ewallet__transfer", {"amount": 50000})),
+        }
+        for chat, name, _ in ens.members:
+            chat.complete = lambda msgs, tools, timeout=None, r=replies[name]: r
+        chosen = ens.complete([{"role": "system", "content": ""}, {"role": "user", "content": ""}], [])
+        chosen_args = json.loads(chosen["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"])
+        self.assertEqual(chosen_args["amount"], 50000)
+        self.assertEqual(ens.last_votes[-1]["agreement"], "2/3")
 
 
 if __name__ == "__main__":

@@ -17,8 +17,8 @@ LORA_DIRNAME=llm-lora-p1                 # main adapter: Qwen3.5-4B LoRA "p1"
 
 # Step-level vote: "served:orchestration,..." with the main adapter first (it breaks ties). Empty = the main adapter alone.
 # Public: main adapter alone 61.26; the vote of the three is scored with the same ASR in result/submission_ens3full_*.jsonl.
-ENSEMBLE=""
-# ENSEMBLE="lifemate:E1P,lifemate_e1:E1,lifemate_synth:E1"
+# ENSEMBLE=""
+ENSEMBLE="lifemate:E1P,lifemate_e1:E1,lifemate_synth:E1"
 
 # Adapters the vLLM server loads, as served_name=folder (folder under the checkpoint root of the caller).
 LORA_ADAPTERS=("$LORA_NAME=$LORA_DIRNAME")

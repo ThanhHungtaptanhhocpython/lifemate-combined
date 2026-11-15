@@ -426,4 +426,71 @@ GOALS = app(A, "Mục tiêu tiết kiệm", "finance", "Heo đất theo mục ti
           "day_of_month": i("Ngày trong tháng. " + INT, lo=1, hi=28)}, ["goal_id", "amount", "day_of_month"]),
 ])
 
-APPS = APPS + [RESTO, CARSVC, CLEAN, FINES, SCREEN, PHOTO, CHARITY, STREAM, HEALTH, GOV, CAR, BABY, GOALS]
+A = "gift_mart"
+GIFTMART = app(A, "Cửa hàng quà tặng", "shopping", "Tìm sản phẩm quà tặng, thêm vào giỏ, đặt mua thanh toán và theo dõi đơn", [
+    tool(A, "search_products", "read", "Tìm sản phẩm theo từ khoá hoặc giá tối đa; truyền query rỗng để liệt kê tất cả sản phẩm",
+         {"query": s("Từ khoá sản phẩm; bỏ trống hoặc rỗng để liệt kê tất cả"), "max_price": i("Giá tối đa (đồng). " + INT, lo=0)},
+         returns="products[]"),
+    tool(A, "get_cart", "read", "Xem các sản phẩm đang có trong giỏ hàng", {}, returns="cart[]"),
+    tool(A, "add_to_cart", "write", "Thêm sản phẩm vào giỏ hàng (chưa đặt mua)",
+         {"product_id": ref_id("sản phẩm", "gift_mart.search_products", "gift_mart.products"),
+          "quantity": i("Số lượng. " + INT, lo=1, hi=50)},
+         ["product_id", "quantity"]),
+    tool(A, "checkout", "write", "Đặt mua và thanh toán toàn bộ giỏ hàng hiện tại",
+         {"payment_method": s("cod = thanh toán khi nhận, wallet = ví, bank = ngân hàng", enum=["cod", "wallet", "bank"]),
+          "address": s("Địa chỉ giao hàng; bỏ trống = địa chỉ mặc định", fuzzy=True)},
+         ["payment_method"]),
+    tool(A, "order_status", "read", "Xem danh sách đơn hàng quà tặng và trạng thái", {}, returns="orders[]"),
+    tool(A, "cancel_order", "write", "Huỷ một đơn hàng đang chờ xử lý",
+         {"order_id": ref_id("đơn hàng", "gift_mart.order_status", "gift_mart.orders")},
+         ["order_id"]),
+])
+
+A = "bakery_shop"
+BAKERY = app(A, "Tiệm bánh & trà", "food", "Tìm bánh ngọt và đồ uống, bỏ vào giỏ hàng, thanh toán đơn", [
+    tool(A, "search_menu", "read", "Tìm món bánh hoặc trà theo tên; để trống query để xem toàn bộ thực đơn",
+         {"query": s("Tên bánh hoặc đồ uống; bỏ trống để xem toàn bộ thực đơn")},
+         returns="items[]"),
+    tool(A, "add_to_cart", "write", "Thêm món vào giỏ hàng của tiệm bánh",
+         {"item_id": ref_id("món", "bakery_shop.search_menu", "bakery_shop.items"),
+          "quantity": i("Số lượng. " + INT, lo=1, hi=50)},
+         ["item_id", "quantity"]),
+    tool(A, "checkout", "write", "Chốt đơn và thanh toán giỏ hàng tiệm bánh",
+         {"payment_method": s("cod = tiền mặt khi nhận, wallet = ví, bank = ngân hàng", enum=["cod", "wallet", "bank"]),
+          "delivery_time": s(ISO + "; bỏ trống = giao ngay", fmt="date-time")},
+         ["payment_method"]),
+    tool(A, "my_orders", "read", "Lịch sử đơn hàng tiệm bánh", {}, returns="orders[]"),
+])
+
+A = "market_watch"
+MARKET = app(A, "Chứng chỉ quỹ & tài sản", "finance", "Xem danh mục nắm giữ, tra mã và giá quỹ/cổ phần, đặt lệnh mua bán, đặt cảnh báo giá", [
+    tool(A, "get_holdings", "read", "Liệt kê các mã chứng chỉ/cổ phần đang nắm giữ cùng số lượng và giá hiện tại", {}, returns="holdings[]"),
+    tool(A, "list_instruments", "read", "Liệt kê tất cả mã chứng chỉ quỹ và cổ phần trên sàn", {}, returns="instruments[]"),
+    tool(A, "get_price", "read", "Xem giá hiện tại của một mã cụ thể; cần lấy mã từ get_holdings hoặc list_instruments",
+         {"code": s("Mã chứng chỉ/cổ phần, ví dụ VFMVF1")}, ["code"], returns="quote"),
+    tool(A, "submit_order", "write", "Đặt lệnh mua hoặc bán một mã",
+         {"code": s("Mã chứng chỉ/cổ phần"), "side": s("buy = mua, sell = bán", enum=["buy", "sell"]),
+          "quantity": i("Số lượng đơn vị. " + INT, lo=1), "price": i("Giá đặt lệnh (đồng). " + INT, lo=100)},
+         ["code", "side", "quantity", "price"]),
+    tool(A, "set_alert", "write", "Đặt cảnh báo khi giá chạm ngưỡng",
+         {"code": s("Mã chứng chỉ/cổ phần"), "price": i("Mức giá ngưỡng (đồng). " + INT, lo=100),
+          "direction": s("above = vượt lên trên, below = giảm xuống dưới", enum=["above", "below"])},
+         ["code", "price", "direction"]),
+])
+
+A = "workshop_pass"
+WORKSHOP = app(A, "Vé hội thảo & sự kiện", "entertainment", "Tìm kiếm hội thảo/buổi diễn theo từ khoá, xem vé đã đặt, đặt hoặc huỷ vé", [
+    tool(A, "search_events", "read", "Tìm sự kiện theo từ khoá tên/chủ đề; không nhận ngày trong query — bỏ trống query để liệt kê mọi sự kiện kèm ngày giờ",
+         {"query": s("Từ khoá tên hoặc chủ đề sự kiện; bỏ trống để xem toàn bộ danh sách")},
+         returns="events[]"),
+    tool(A, "my_passes", "read", "Danh sách vé hội thảo đã đặt", {}, returns="passes[]"),
+    tool(A, "reserve_pass", "write", "Đặt vé tham gia sự kiện",
+         {"event_id": ref_id("sự kiện", "workshop_pass.search_events", "workshop_pass.events"),
+          "quantity": i("Số lượng vé. " + INT, lo=1, hi=20)},
+         ["event_id", "quantity"]),
+    tool(A, "cancel_pass", "write", "Huỷ vé đã đặt",
+         {"pass_id": ref_id("vé", "workshop_pass.my_passes", "workshop_pass.passes")},
+         ["pass_id"]),
+])
+
+APPS = APPS + [RESTO, CARSVC, CLEAN, FINES, SCREEN, PHOTO, CHARITY, STREAM, HEALTH, GOV, CAR, BABY, GOALS, GIFTMART, BAKERY, MARKET, WORKSHOP]

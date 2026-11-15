@@ -10,6 +10,7 @@ template; before training, every assistant turn's prefix is checked to equal wha
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
 import random
@@ -176,11 +177,14 @@ def main() -> None:
     if a.fuzzy_weight is not None:
         n_fz = sum(sum(x != 1.0 for x, l in zip(r["loss_weights"], r["labels"]) if l != -100) for r in rows)
         print(f"free-text tokens weighted {a.fuzzy_weight}: {n_fz:,} of {n_lab:,} trained tokens", flush=True)
+    ta_params = inspect.signature(TrainingArguments.__init__).parameters
+    extra_ta = {"train_sampling_strategy": "group_by_length" if a.batch > 1 else "random"} if "train_sampling_strategy" in ta_params else {"group_by_length": a.batch > 1}
     trainer_cls = WeightedLossTrainer if a.fuzzy_weight is not None else CompletionLogitsTrainer
     trainer = trainer_cls(
         model=model, train_dataset=Dataset.from_list(rows),
         data_collator=WeightedCollator(tok.pad_token_id) if a.fuzzy_weight is not None else DataCollatorForSeq2Seq(tok, padding=True, label_pad_token_id=-100),
-        args=TrainingArguments(output_dir=str(a.out), per_device_train_batch_size=a.batch, gradient_accumulation_steps=a.grad_accum, train_sampling_strategy="group_by_length" if a.batch > 1 else "random",
+        args=TrainingArguments(output_dir=str(a.out), per_device_train_batch_size=a.batch, gradient_accumulation_steps=a.grad_accum,
+                               **extra_ta,
                                num_train_epochs=a.epochs, max_steps=a.max_steps, learning_rate=a.lr, warmup_steps=10,
                                lr_scheduler_type="cosine", optim="adamw_8bit", weight_decay=0.0, bf16=bf16, fp16=not bf16,
                                logging_steps=5, save_strategy="steps", save_steps=a.save_steps, save_total_limit=4,

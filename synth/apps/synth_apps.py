@@ -953,3 +953,166 @@ class SavingsGoals(App):
     @write
     def set_auto_deposit(self, goal_id=None, amount=None, day_of_month=None, **_):
         return self.patch("goals", "goal_id", goal_id, set={"auto": {"amount": amount, "day_of_month": day_of_month}})
+
+
+class GiftMart(App):
+    name = "gift_mart"
+
+    @read
+    def search_products(self, query=None, max_price=None, **_):
+        out = self.read("products", contains={("name", "category"): query})
+        if max_price is not None:
+            out["products"] = [p for p in out["products"] if p.get("price", 0) <= max_price]
+        return out
+
+    @read
+    def get_cart(self, **_):
+        return self.read("cart")
+
+    @write
+    def add_to_cart(self, product_id=None, quantity=None, **_):
+        p = self.find("products", product_id)
+        if p is None:
+            return self.noop(f"không tìm thấy product_id={product_id!r}")
+        cart = self.state.setdefault("cart", [])
+        for row in cart:
+            if row.get("product_id") == p["id"]:
+                row["quantity"] += int(quantity or 1)
+                return {"ok": True, "cart": cart}
+        cart.append({"product_id": p["id"], "name": p["name"], "price": p["price"], "quantity": int(quantity or 1)})
+        return {"ok": True, "cart": cart}
+
+    @write
+    def checkout(self, payment_method=None, address=None, **_):
+        cart = self.state.get("cart", [])
+        if not cart:
+            return self.noop("giỏ hàng đang trống")
+        total = sum(r.get("price", 0) * r.get("quantity", 1) for r in cart)
+        items = [{"product_id": r["product_id"], "quantity": r["quantity"]} for r in cart]
+        self.state["cart"] = []
+        r = self.create("orders", "gm", items=items, total=total, payment_method=payment_method,
+                        address=address or self.state.get("default_address", "Địa chỉ mặc định"), status="placed")
+        return {"ok": True, "order": r["item"]}
+
+    @read
+    def order_status(self, **_):
+        return self.read("orders")
+
+    @write
+    def cancel_order(self, order_id=None, **_):
+        o = self.find("orders", order_id)
+        if o is None or o.get("status") == "cancelled":
+            return self.noop(f"không có đơn hợp lệ order_id={order_id!r}")
+        o["status"] = "cancelled"
+        return {"ok": True, "order": o}
+
+
+class BakeryShop(App):
+    name = "bakery_shop"
+
+    @read
+    def search_menu(self, query=None, **_):
+        return self.read("items", contains={("name", "tag"): query})
+
+    @write
+    def add_to_cart(self, item_id=None, quantity=None, **_):
+        it = self.find("items", item_id)
+        if it is None:
+            return self.noop(f"không tìm thấy item_id={item_id!r}")
+        cart = self.state.setdefault("cart", [])
+        cart.append({"item_id": it["id"], "name": it["name"], "price": it["price"], "quantity": int(quantity or 1)})
+        return {"ok": True, "cart": cart}
+
+    @write
+    def checkout(self, payment_method=None, delivery_time=None, **_):
+        cart = self.state.get("cart", [])
+        if not cart:
+            return self.noop("giỏ hàng đang trống")
+        total = sum(r.get("price", 0) * r.get("quantity", 1) for r in cart)
+        items = [{"item_id": r["item_id"], "quantity": r["quantity"]} for r in cart]
+        self.state["cart"] = []
+        r = self.create("orders", "bk", items=items, total=total, payment_method=payment_method,
+                        delivery_time=delivery_time, status="confirmed")
+        return {"ok": True, "order": r["item"]}
+
+    @read
+    def my_orders(self, **_):
+        return self.read("orders")
+
+
+class MarketWatch(App):
+    name = "market_watch"
+
+    @read
+    def get_holdings(self, **_):
+        return self.read("holdings")
+
+    @read
+    def list_instruments(self, **_):
+        return self.read("instruments")
+
+    @read
+    def get_price(self, code=None, **_):
+        hits = [x for x in self.state.get("instruments", []) if str(x.get("code", "")).upper() == str(code or "").upper()]
+        if not hits:
+            return {"ok": False, "message": f"không tìm thấy mã {code!r}"}
+        return {"ok": True, "quote": hits[0]}
+
+    @write
+    def submit_order(self, code=None, side=None, quantity=None, price=None, **_):
+        inst = next((x for x in self.state.get("instruments", []) if str(x.get("code", "")).upper() == str(code or "").upper()), None)
+        if inst is None:
+            return self.noop(f"không tìm thấy mã {code!r}")
+        if side == "sell":
+            h = next((x for x in self.state.get("holdings", []) if str(x.get("code", "")).upper() == inst["code"]), None)
+            if h is None or h.get("quantity", 0) < int(quantity or 0):
+                return self.noop("không đủ số lượng nắm giữ để bán")
+            h["quantity"] -= int(quantity)
+        else:
+            h = next((x for x in self.state.get("holdings", []) if str(x.get("code", "")).upper() == inst["code"]), None)
+            if h is None:
+                self.state.setdefault("holdings", []).append({"code": inst["code"], "name": inst["name"], "quantity": int(quantity), "price": inst["price"]})
+            else:
+                h["quantity"] += int(quantity)
+        r = self.create("orders", "mo", code=inst["code"], side=side, quantity=int(quantity), price=int(price), status="submitted")
+        return {"ok": True, "order": r["item"]}
+
+    @write
+    def set_alert(self, code=None, price=None, direction=None, **_):
+        inst = next((x for x in self.state.get("instruments", []) if str(x.get("code", "")).upper() == str(code or "").upper()), None)
+        if inst is None:
+            return self.noop(f"không tìm thấy mã {code!r}")
+        r = self.create("alerts", "al", code=inst["code"], price=int(price), direction=direction)
+        return {"ok": True, "alert": r["item"]}
+
+
+class WorkshopPass(App):
+    name = "workshop_pass"
+
+    @read
+    def search_events(self, query=None, **_):
+        return self.read("events", contains={("name", "topic"): query})
+
+    @read
+    def my_passes(self, **_):
+        return self.read("passes")
+
+    @write
+    def reserve_pass(self, event_id=None, quantity=None, **_):
+        ev = self.find("events", event_id)
+        if ev is None:
+            return self.noop(f"không tìm thấy event_id={event_id!r}")
+        q = int(quantity or 1)
+        if ev.get("available", 0) < q:
+            return self.noop("không đủ chỗ trống")
+        ev["available"] -= q
+        r = self.create("passes", "wp", event_id=ev["id"], quantity=q, total=ev.get("price", 0) * q, status="booked")
+        return {"ok": True, "pass": r["item"]}
+
+    @write
+    def cancel_pass(self, pass_id=None, **_):
+        p = self.find("passes", pass_id)
+        if p is None or p.get("status") == "cancelled":
+            return self.noop(f"không có vé hợp lệ pass_id={pass_id!r}")
+        p["status"] = "cancelled"
+        return {"ok": True, "pass": p}

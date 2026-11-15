@@ -15,11 +15,23 @@ import json
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
-from .agent import prompt_for, user_message
+from .agent import clean_arguments, prompt_for, user_message
 from .llm import LocalChat
 
 
-def _proposal_key(response: dict) -> str:
+def _canonical_name(name: object, aliases: dict[str, str] | None) -> object:
+    if not isinstance(name, str):
+        return name
+    if aliases is not None:
+        return aliases.get(name, name)
+    return name.replace("__", ".", 1) if "__" in name else name
+
+
+def _proposal_key(
+    response: dict,
+    specs_by_name: dict[str, dict] | None = None,
+    aliases: dict[str, str] | None = None,
+) -> str:
     message = response["choices"][0]["message"]
     calls = message.get("tool_calls") or []
     if not calls:
@@ -27,11 +39,20 @@ def _proposal_key(response: dict) -> str:
     out = []
     for call in calls:
         fn = call.get("function", {})
-        try:
-            args = json.loads(fn.get("arguments") or "{}")
-        except (TypeError, ValueError):
-            args = fn.get("arguments")
-        out.append([fn.get("name"), args])
+        name = _canonical_name(fn.get("name"), aliases)
+        raw_args = fn.get("arguments")
+        if isinstance(raw_args, dict):
+            args = raw_args
+        else:
+            try:
+                args = json.loads(raw_args or "{}")
+            except (TypeError, ValueError):
+                args = raw_args
+        if isinstance(args, dict) and isinstance(name, str):
+            if name == "sys.ask_missing_info" and isinstance(args.get("tool_name"), str):
+                args = {**args, "tool_name": _canonical_name(args["tool_name"], aliases)}
+            args = clean_arguments((specs_by_name or {}).get(name), args)
+        out.append([name, args])
     return json.dumps(out, ensure_ascii=False, sort_keys=True)
 
 
@@ -43,11 +64,15 @@ class EnsembleChat:
         self.members = [(LocalChat(url, name, timeout), name, orch) for name, orch in members]
         self.pool = ThreadPoolExecutor(max_workers=len(members))
         self.heads: dict[str, tuple[dict, dict]] = {}
+        self.specs_by_name: dict[str, dict] = {}
+        self.aliases: dict[str, str] = {}
         self.last_votes: list[dict] = []
 
     def bind(self, item: dict, transcript: str, specs: list[dict]) -> None:
         self.heads = {orch: ({"role": "system", "content": prompt_for(orch)}, user_message(item, transcript, orch, specs))
                       for _, _, orch in self.members}
+        self.specs_by_name = {s["name"]: s for s in specs}
+        self.aliases = {s["name"].replace(".", "__"): s["name"] for s in specs}
 
     def _view(self, messages: list[dict], orch: str) -> list[dict]:
         """The agent's messages with the system prompt and the request message of this member's orchestration."""
@@ -67,7 +92,7 @@ class EnsembleChat:
             except Exception as exc:   # a failed member just loses its vote
                 responses.append(None)
                 errors.append(f"{type(exc).__name__}: {exc}")
-        keys = [(_proposal_key(r) if r is not None else None) for r in responses]
+        keys = [(_proposal_key(r, self.specs_by_name, self.aliases) if r is not None else None) for r in responses]
         counts = Counter(k for k in keys if k is not None)
         if not counts:
             raise RuntimeError("every ensemble member failed: " + "; ".join(errors))
